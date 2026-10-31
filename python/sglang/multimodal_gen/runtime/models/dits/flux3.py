@@ -36,7 +36,7 @@ request.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import msgspec
 import torch
@@ -606,7 +606,7 @@ class Flux3Block(nn.Module):
         )
 
 
-class Flux3SegmentState(msgspec.Struct, frozen=True):
+class Flux3SegmentState(NamedTuple):
     """A stream (or the text context) after its mode blocks, ready for the joint blocks."""
 
     name: str

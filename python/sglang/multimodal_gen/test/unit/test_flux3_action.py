@@ -703,6 +703,38 @@ def test_cuda_graph_replays_match_eager_denoise_steps(request):
     assert (info.captures, info.hits, info.failures) == (1, 1, 0)
 
 
+@pytest.mark.parametrize("frames", [1, 2])
+@pytest.mark.parametrize("text_len", [3, 5])
+def test_compiled_stream_encoding_matches_eager_in_one_graph(request, frames, text_len):
+    """Segment states are built inside compiled steps without a graph break."""
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
+
+    request.getfixturevalue("single_process_model_parallel")
+    torch.manual_seed(0)
+    model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    video, ids = pack_video(torch.randn(1, 96, frames, 2, 3), first_frame=1, fps=15.0)
+    ctx = torch.randn(1, text_len, 32)
+
+    def encode(ctx, video, t):
+        context = model.encode_context(ctx, text_ids(text_len))
+        stream = model.encode_stream(name="video", x=video, ids=ids, timesteps=t)
+        return context.hidden, stream.hidden, stream.length
+
+    inputs = (ctx, video, torch.full((1,), 0.7))
+    torch._dynamo.reset()
+    with torch.no_grad(), set_forward_context(current_timestep=0, attn_metadata=None):
+        eager = encode(*inputs)
+        compiled = torch.compile(encode, backend="eager", fullgraph=True)(*inputs)
+    assert compiled[2] == eager[2] == video.shape[1]
+    for actual, expected in zip(compiled[:2], eager[:2], strict=True):
+        assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("fnuz", [False, True])
 @pytest.mark.parametrize("tuple_output", [False, True])
 def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
