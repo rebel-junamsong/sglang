@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ActionObservationEncodingStage,
     Flux3ActionPreprocessStage,
     Flux3ActionTextEncodingStage,
+    Flux3ActionVideoDecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionPostprocessStage,
@@ -202,6 +203,10 @@ class Flux3ActionPipeline(ComposedPipelineBase):
                 use_cuda_graph=config.cuda_graph_enabled(server_args, "transformer"),
             ),
             "flux3_action_denoise",
+        )
+        self.add_stage(
+            Flux3ActionVideoDecodingStage(config, vae=self.get_module("vae")),
+            "flux3_action_video_decode",
         )
         self.add_stage(VLAActionPostprocessStage(), "flux3_action_postprocess")
 

@@ -26,6 +26,9 @@ class Flux3ActionSamplingParams(ActionSamplingParams):
     return_timing: bool = True
     # False bypasses the per-caption text context cache for this request.
     enable_prefix_cache: bool = True
+    # Also decode the denoised video latents and return them as an MP4; needs
+    # the VAE decoder (``--vae-config.load-decoder true``).
+    return_video: bool = False
     # Camera frames keyed by camera name (``wrist``, ``left``, ...), or a
     # prebuilt ``composite``; HWC uint8 arrays, PIL images or tensors.
     images: dict[str, Any] | None = field(
@@ -53,6 +56,7 @@ class Flux3ActionSamplingParams(ActionSamplingParams):
                 "guidance_scale": self.guidance_scale,
                 "guidance_scale_action": self.guidance_scale_action,
                 "enable_prefix_cache": self.enable_prefix_cache,
+                "return_video": self.return_video,
             },
         }
         return extra

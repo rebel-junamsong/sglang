@@ -5,7 +5,8 @@ The policy follows the FLUX Action reference implementation
 (https://github.com/black-forest-labs/flux-action): the camera frames are
 composed onto one canvas and VAE-encoded as the ``video_cond`` stream, the
 normalized state is the ``<action>_cond`` token, and future video latents are
-denoised jointly with the action chunk. Only the actions are returned.
+denoised jointly with the action chunk. The actions are returned, plus the
+decoded video when the request sets ``return_video``.
 
 Everything that does not depend on the noised streams is computed once: the
 text context per caption (cached across requests), the conditioning streams
@@ -15,13 +16,17 @@ conditional and unconditional CFG passes, since mode blocks never see text).
 
 from __future__ import annotations
 
+import base64
 import copy
 import functools
+import os
+import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
+import imageio
 import msgspec
 import numpy as np
 import torch
@@ -895,6 +900,8 @@ class Flux3ActionDenoisingStage(PipelineStage):
                 n_steps=steps,
                 shift=cfg.sampler_shift,
             )
+        if vla_options(batch).get("return_video"):
+            state["flux3_video_latent"] = result["video"]
         targets = result[cfg.action_modality][0].float() / cfg.action_scale
         actions = targets_to_actions(
             targets, state=observation.state.to(device), config=cfg
@@ -902,4 +909,63 @@ class Flux3ActionDenoisingStage(PipelineStage):
         state["actions"] = actions[None, :horizon]
         synchronize_vla_action_tensor(actions)
         vla_timings(batch)["denoise_ms"] = (time.perf_counter() - start) * 1000
+        return batch
+
+
+def _encode_mp4(frames: np.ndarray, fps: float) -> bytes:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "video.mp4")
+        imageio.mimsave(
+            path, list(frames), fps=fps, codec="libx264", macro_block_size=1
+        )
+        with open(path, "rb") as f:
+            return f.read()
+
+
+class Flux3ActionVideoDecodingStage(PipelineStage):
+    """Observed + denoised video latents -> MP4, for requests with ``return_video``."""
+
+    def __init__(self, config: Flux3ActionPipelineConfig, vae: Flux3VideoVAE):
+        super().__init__()
+        self.config = config
+        self.vae = vae
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                stage_name=self._component_stage_name(stage_name),
+                component_name="vae",
+            )
+        ]
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        state = vla_state(batch)
+        video_latent = state.pop("flux3_video_latent", None)
+        if video_latent is None:
+            return batch
+        start = time.perf_counter()
+        cfg = self.config
+        h, w = cfg.latent_hw
+        video = rearrange(video_latent, "b (t h w) c -> b c t h w", h=h, w=w)
+        observation: Flux3ActionObservation = state["flux3_observation"]
+        frame = observation.canvas.to(video.device, torch.bfloat16)[None]
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            observed = self.vae.encode_frame(frame)[..., :h, :w]
+            latents = torch.cat([observed, video.to(observed.dtype)], dim=2)
+            frames = self.vae.decode(latents)[0].float()
+        height, width = (
+            DROID_COMPOSITE_HW if cfg.camera_layout == "droid" else cfg.canvas_hw
+        )
+        frames = ((frames[:, :, :height, :width] + 1) * 127.5).round()
+        frames = frames.to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
+        state["video"] = {
+            "type": "video",
+            "format": "mp4",
+            "fps": cfg.fps,
+            "shape": list(frames.shape),
+            "b64_json": base64.b64encode(_encode_mp4(frames, cfg.fps)).decode(),
+        }
+        vla_timings(batch)["video_decode_ms"] = (time.perf_counter() - start) * 1000
         return batch

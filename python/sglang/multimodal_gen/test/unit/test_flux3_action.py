@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import contextlib
 import json
 from types import SimpleNamespace
 
+import imageio.v3 as iio
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
@@ -20,6 +24,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
 )
 from sglang.multimodal_gen.configs.sample.flux3_action import Flux3ActionSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    action_generation_response,
     action_metadata,
     build_action_sampling_params,
 )
@@ -27,6 +32,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multi
     FlowUniPCMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action import (
+    Flux3ActionVideoDecodingStage,
     _cfg_parallel_policy,
     cosmos_unipc,
     denormalize,
@@ -227,6 +233,75 @@ def test_action_request_builds_flux3_sampling_params():
     extra = params.build_request_extra()["vla"]
     assert set(extra["observation"]["images"]) == {"wrist", "left", "right"}
     assert extra["options"]["guidance_scale"] == 2.0
+
+
+@pytest.mark.parametrize("requested", [None, False, True])
+def test_return_video_reaches_the_stage_options(requested):
+    parameters = {} if requested is None else {"return_video": requested}
+    payload = {
+        "input": {"task": "pour the cup", "observation": {"state": [0.0] * 8}},
+        "parameters": parameters,
+    }
+    params = build_action_sampling_params(payload, _server_args(_droid_config()))
+    options = params.build_request_extra()["vla"]["options"]
+    assert params.return_video is options["return_video"] is bool(requested)
+
+
+class _StubVideoVAE(torch.nn.Module):
+    """Pools a frame to its latent RGB; decodes latent RGB at 32x, 4 frames per latent."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+
+    def encode_frame(self, frame):
+        rgb = F.avg_pool2d(frame.float(), 32)
+        return torch.cat([rgb, rgb.new_zeros(1, 93, *rgb.shape[-2:])], 1)[:, :, None]
+
+    def decode(self, latents):
+        rgb = latents[:, :3].float().repeat_interleave(32, -1).repeat_interleave(32, -2)
+        return torch.cat([rgb[:, :, :1], rgb[:, :, 1:].repeat_interleave(4, 2)], 2)
+
+
+@pytest.mark.parametrize("latent_frames", [1, 2])
+@pytest.mark.parametrize("latent_hw", [(2, 3), (3, 4)])
+def test_video_decoding_stage_returns_observed_and_predicted_frames(
+    latent_frames, latent_hw
+):
+    h, w = latent_hw
+    cfg = SimpleNamespace(
+        latent_hw=latent_hw, camera_layout="grid", canvas_hw=(32 * h, 32 * w), fps=15.0
+    )
+    stage = Flux3ActionVideoDecodingStage(cfg, vae=_StubVideoVAE())
+    stage.use_declared_component = lambda **_: contextlib.nullcontext()
+    observation = SimpleNamespace(canvas=torch.rand(3, 32 * h, 32 * w) * 2 - 1)
+    predicted = torch.rand(1, latent_frames * h * w, 96) * 2 - 1
+    state = {"flux3_observation": observation, "flux3_video_latent": predicted}
+    batch = SimpleNamespace(extra={"vla": state})
+
+    stage.forward(batch, None)
+
+    video = state["video"]
+    frames = 1 + 4 * latent_frames
+    assert video["shape"] == [frames, 32 * h, 32 * w, 3]
+    assert "flux3_video_latent" not in state
+    assert "video_decode_ms" in state["timings"]
+    decoded = iio.imread(base64.b64decode(video["b64_json"]), extension=".mp4")
+    assert decoded.shape == (frames, 32 * h, 32 * w, 3)
+
+
+def test_video_decoding_stage_skips_requests_without_return_video():
+    stage = Flux3ActionVideoDecodingStage(SimpleNamespace(), vae=_StubVideoVAE())
+    batch = SimpleNamespace(extra={"vla": {}})
+    stage.forward(batch, None)
+    assert batch.extra["vla"] == {}
+
+
+@pytest.mark.parametrize("video", [None, {"type": "video", "b64_json": ""}])
+def test_action_response_attaches_the_video_only_when_decoded(video):
+    output = {"actions": [[0.0, 1.0]], "video": video}
+    response = action_generation_response(output, _server_args(_droid_config()))
+    assert response["data"][0].get("video") is video
 
 
 def test_json_pixel_lists_become_arrays_before_ipc():

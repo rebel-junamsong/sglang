@@ -431,6 +431,7 @@ def _build_action_model_sampling_params(
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
+        "return_video": _runtime_bool(parameters.get("return_video"), False),
     }
     # Optional per-request overrides; absent keys keep the model defaults.
     for name in ("seed", "guidance_scale", "guidance_scale_action"):
@@ -529,6 +530,8 @@ def action_generation_response(
                 "action": action,
             }
         )
+    if output.get("video") is not None:
+        data[0]["video"] = output["video"]
 
     action_shape = data[0]["action"]["shape"]
 

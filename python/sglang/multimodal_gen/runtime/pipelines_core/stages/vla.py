@@ -610,6 +610,8 @@ class VLAActionPostprocessStage(PipelineStage):
             payload["cache"] = state.get("cache", {})
         if state.get("parallel") is not None:
             payload["parallel"] = state["parallel"]
+        if state.get("video") is not None:
+            payload["video"] = state["video"]
 
         return OutputBatch(
             output=[payload],
